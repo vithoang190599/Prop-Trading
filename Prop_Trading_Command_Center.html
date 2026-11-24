@@ -280,12 +280,123 @@ function download(name,content,type='text/csv;charset=utf-8;'){const blob=new Bl
 function exportCSV(key){const rows=state[key];if(!rows.length){alert('Chưa có dữ liệu để export.');return}const cols=[...new Set(rows.flatMap(x=>Object.keys(x)))];download(`prop-trading-${key}-${todayISO()}.csv`,[cols.map(csvCell).join(','),...rows.map(x=>cols.map(c=>csvCell(x[c])).join(','))].join('\r\n'))}
 function exportBackup(){download(`prop-trading-backup-${todayISO()}.json`,JSON.stringify({...state,exportedAt:new Date().toISOString()},null,2),'application/json')}
 function importBackup(file){const r=new FileReader();r.onload=()=>{try{const x=JSON.parse(r.result);if(!x||!Array.isArray(x.accounts)||!Array.isArray(x.expenses)||!Array.isArray(x.trades))throw new Error('Invalid format');if(!confirm('Import backup sẽ thay thế dữ liệu hiện tại. Bạn đã export backup hiện tại chưa?'))return;state={...blank(),...x,settings:{...blank().settings,...(x.settings||{})},actions:Array.isArray(x.actions)?x.actions:[]};renderAll();alert('Import backup thành công.')}catch(e){alert('Không thể import file: cấu trúc JSON không hợp lệ.')}};r.readAsText(file)}
+let pendingAiTrade=null,aiImageObjectUrl=null;
+function makeAiPrompt(){
+ const accountId=$('#aiAccount').value,account=state.accounts.find(a=>a.id===accountId),method=$('#aiMethod').value.trim(),file=$('#aiChartFile').files[0];
+ if(!account){alert('Chọn Prop Account trước.');return ''}if(!method){alert('Nhập Trading Method trước.');return ''}if(!file){alert('Chọn chart screenshot trước.');return ''}
+ state.settings.lastCaptureAccount=accountId;state.settings.lastCaptureMethod=method;save();
+ const psychology=$('#aiPsychBefore').value,rule=$('#aiRuleFollowed').value;
+ return [
+ 'You are my Prop Trading AI Journal Agent. Analyze the attached trading-chart screenshot and extract only information explicitly visible or calculable from visible numeric prices.',
+ 'USER-SELECTED CONTEXT (do not change):',
+ 'Prop Firm: '+account.firm,
+ 'Account name: '+account.name,
+ 'Local account ID: '+account.id,
+ 'Trading method: '+method,
+ 'Psychology before (user-reported): '+(psychology||'not provided'),
+ 'Plan adherence (user-reported): '+(rule||'not reviewed'),
+ 'STRICT RULES:',
+ '1. Never guess unreadable prices, date/time, direction, instrument, timeframe or session. Use null and explain in warnings.',
+ '2. Read exact Entry / SL / TP numeric labels. Do not estimate prices from pixels or candle heights.',
+ '3. Direction must be Long, Short or null. Session must be Asia, London, New York, Off-session or null; classify only when chart time/timezone are clear.',
+ '4. Date must be YYYY-MM-DDTHH:mm only when visible; otherwise null. Do not substitute current date.',
+ '5. Calculate plannedRR = abs(TP-Entry)/abs(Entry-SL) only when all three prices are clearly readable and geometry is valid. Otherwise null.',
+ '6. Set tradeStatus=Open unless screenshot clearly proves the trade is closed. Never invent realized P&L, cash risk, MFE or MAE.',
+ '7. Give a concise setup description and aiConfidence high/medium/low. Separate observation from interpretation.',
+ '8. Return valid JSON only. No Markdown fences or prose.',
+ 'EXPECTED JSON:',
+ '{',
+ '  "trade": {',
+ '    "date": null, "instrument": null, "direction": null, "session": null, "timeframe": null,',
+ '    "entry": null, "stop": null, "target": null, "plannedRR": null, "tradeStatus": "Open",',
+ '    "setup": "", "aiConfidence": "low", "aiNotes": "", "pnl": null, "risk": null, "mfe": null, "mae": null',
+ '  },',
+ '  "warnings": []',
+ '}'
+ ].join('\n');
+}
+function copyAiPrompt(){
+ const prompt=makeAiPrompt();if(!prompt)return;$('#aiPromptBox').value=prompt;
+ if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(prompt).then(()=>alert('Đã copy prompt. Quay lại ChatGPT, đính kèm ảnh chart và gửi prompt.')).catch(()=>{$('#aiPromptBox').focus();$('#aiPromptBox').select();alert('Prompt đã hiển thị; hãy copy thủ công.')})}
+ else{$('#aiPromptBox').focus();$('#aiPromptBox').select();alert('Prompt đã hiển thị; hãy copy thủ công.')}
+}
+function aiNum(v){if(v===null||v===undefined||v==='')return '';const n=Number(v);return Number.isFinite(n)?n:''}
+function reviewAiJson(){
+ const raw=$('#aiJsonInput').value.trim();if(!raw){alert('Dán JSON do ChatGPT trả về trước.');return}
+ const accountId=$('#aiAccount').value,account=state.accounts.find(a=>a.id===accountId),method=$('#aiMethod').value.trim();
+ if(!account||!method){alert('Chọn account và method trong Trade context.');return}
+ let parsed;
+ try{let txt=raw.replace(/^\x60{3}(?:json)?\s*/i,'').replace(/\s*\x60{3}$/,'');const first=txt.indexOf('{'),last=txt.lastIndexOf('}');if(first>=0&&last>first)txt=txt.slice(first,last+1);parsed=JSON.parse(txt)}
+ catch(e){$('#aiImportStatus').innerHTML='<div class="insight warn"><b>JSON không hợp lệ</b>Kiểm tra nội dung copy từ ChatGPT.</div>';return}
+ const t=parsed.trade||parsed;if(!t||typeof t!=='object'||Array.isArray(t)){alert('Không tìm thấy trade object trong JSON.');return}
+ let warnings=Array.isArray(parsed.warnings)?parsed.warnings.slice():[];
+ const directionText=String(t.direction||'').toLowerCase(),direction=directionText==='long'||directionText==='buy'?'Long':directionText==='short'||directionText==='sell'?'Short':'Unknown';
+ let tradeDate=typeof t.date==='string'?t.date:'';const dateNeedsReview=!tradeDate;
+ if(tradeDate&&/^\d{4}-\d{2}-\d{2}$/.test(tradeDate))tradeDate+='T00:00';
+ if(!tradeDate)tradeDate=localDateTimeInput();
+ const file=$('#aiChartFile').files[0];
+ const trade={
+  id:uid(),date:tradeDate,dateNeedsReview,instrument:String(t.instrument||''),direction,
+  session:['Asia','London','New York','Off-session'].includes(t.session)?t.session:'',
+  timeframe:String(t.timeframe||''),accountId,method,setup:String(t.setup||''),
+  tradeStatus:['Open','Planned','Closed','Cancelled'].includes(t.tradeStatus)?t.tradeStatus:'Open',
+  entry:aiNum(t.entry),stop:aiNum(t.stop),target:aiNum(t.target),exit:aiNum(t.exit),
+  pnl:aiNum(t.pnl),risk:aiNum(t.risk),mfe:aiNum(t.mfe),mae:aiNum(t.mae),
+  mfePts:aiNum(t.mfePts),maePts:aiNum(t.maePts),holdMinutes:aiNum(t.holdMinutes),plannedRR:'',
+  psychBefore:$('#aiPsychBefore').value,psychDuring:'',psychAfter:'',ruleFollowed:$('#aiRuleFollowed').value,
+  mistake:'',lesson:'',notes:String(t.aiNotes||''),screenshot:'',screenshotName:file?file.name:'',
+  captureSource:'ChatGPT AI chart extraction',aiConfidence:String(t.aiConfidence||'low'),aiWarnings:[]
+ };
+ if(trade.tradeStatus==='Closed'&&trade.pnl===''){trade.tradeStatus='Open';warnings.push('Closed status had no realized P&L; reset to Open.')}
+ const rr=calcPlannedRR(trade);trade.plannedRR=rr===null?'':rr;
+ if(trade.entry===''||trade.stop===''||trade.target==='')warnings.push('Entry / SL / TP chưa đầy đủ; Planned RR chưa thể tính.');
+ else if(rr===null)warnings.push('Các mức giá có thể không phù hợp với direction; cần kiểm tra Entry / SL / TP.');
+ if(dateNeedsReview)warnings.push('Chart không hiển thị ngày giờ rõ ràng; dashboard tạm ghi thời điểm capture. Hãy sửa Date nếu đây là ảnh lịch sử.');
+ trade.aiWarnings=warnings;pendingAiTrade=trade;
+ const items=[
+  ['Date',trade.dateNeedsReview?trade.date+' · verify':trade.date],
+  ['Account',account.firm+' · '+account.name],
+  ['Instrument / Direction',(trade.instrument||'Unknown')+' · '+trade.direction],
+  ['Timeframe / Session',(trade.timeframe||'—')+' · '+(trade.session||'—')],
+  ['Method',trade.method],['Entry',trade.entry],['Stop Loss',trade.stop],['Take Profit',trade.target],
+  ['Planned RR',rr===null?'Not calculable':rr.toFixed(2)+'R'],['Status',trade.tradeStatus],['AI confidence',trade.aiConfidence]
+ ];
+ let html='<div class="cardhead"><h3>Extraction preview</h3><span>Kiểm tra trước khi import</span></div><div class="ai-preview-grid">';
+ items.forEach(x=>{html+='<div><label>'+x[0]+'</label><strong>'+esc(x[1]===null||x[1]===''?'—':x[1])+'</strong></div>'});
+ html+='</div>';
+ if(warnings.length){html+='<div class="callout ai-warnings" style="margin-top:12px"><strong>Warnings / cần kiểm tra</strong><ul>';warnings.forEach(w=>{html+='<li>'+esc(w)+'</li>'});html+='</ul></div>'}
+ else{html+='<div class="ai-muted" style="margin-top:10px">Parser không phát hiện cảnh báo. Vẫn cần đối chiếu với ảnh gốc.</div>'}
+ html+='<p class="ai-muted">Planned RR do dashboard tự tính. P&L, cash risk, MFE và MAE chỉ được lưu khi có dữ liệu thực tế.</p>';
+ $('#aiTradePreview').innerHTML=html;$('#aiTradePreview').classList.remove('hidden');$('#importAiTrade').classList.remove('hidden');$('#importAiTrade').disabled=false;
+ $('#aiImportStatus').innerHTML='<div class="insight info"><b>JSON parsed</b>Chưa lưu vào Journal. Kiểm tra preview rồi bấm Import.</div>';
+}
+function importAiTrade(){
+ if(!pendingAiTrade)return;
+ const duplicate=state.trades.some(t=>t.accountId===pendingAiTrade.accountId&&t.instrument===pendingAiTrade.instrument&&t.direction===pendingAiTrade.direction&&t.entry===pendingAiTrade.entry&&t.date===pendingAiTrade.date);
+ if(duplicate&&!confirm('Có thể đã tồn tại trade tương tự (cùng account, instrument, direction, entry và date). Vẫn import?'))return;
+ state.trades.push({...pendingAiTrade});state.settings.lastCaptureAccount=pendingAiTrade.accountId;state.settings.lastCaptureMethod=pendingAiTrade.method;
+ renderAll();alert('Đã import vào Trade Journal. Kiểm tra Date nếu chart không hiển thị ngày giờ.');
+ pendingAiTrade=null;$('#aiTradePreview').classList.add('hidden');$('#importAiTrade').classList.add('hidden');$('#importAiTrade').disabled=true;$('#aiJsonInput').value='';nav('journal');
+}
+function clearAiCapture(){
+ if(aiImageObjectUrl){URL.revokeObjectURL(aiImageObjectUrl);aiImageObjectUrl=null}
+ $('#aiChartFile').value='';$('#aiImagePreview').removeAttribute('src');$('#aiImagePreview').classList.add('hidden');
+ $('#aiImageMeta').textContent='Chưa chọn ảnh.';$('#aiPromptBox').value='';$('#aiJsonInput').value='';
+ $('#aiTradePreview').classList.add('hidden');$('#aiImportStatus').innerHTML='';
+ $('#importAiTrade').classList.add('hidden');$('#importAiTrade').disabled=true;pendingAiTrade=null;
+}
 function addAction(){const text=prompt('Nhập một hành động cải thiện cụ thể (ví dụ: Chỉ vào lệnh khi MSS có displacement và candle close xác nhận):');if(!text||!text.trim())return;const priority=prompt('Priority: High / Normal / Low','Normal')||'Normal';const due=prompt('Due date (YYYY-MM-DD), bỏ trống nếu chưa xác định:','')||'';state.actions.push({id:uid(),text:text.trim(),priority,due,done:false});renderAll()}
 // Navigation and delegated actions
 document.addEventListener('click',e=>{const n=e.target.closest('[data-nav]');if(n){nav(n.dataset.nav);return}const op=e.target.closest('[data-open]');if(op){const type=op.dataset.open;showModal(type+'Modal');return}const close=e.target.closest('[data-close]');if(close){$('#'+close.dataset.close).close();return}
  const ee=e.target.closest('[data-edit-expense]');if(ee){const x=state.expenses.find(a=>a.id===ee.dataset.editExpense);showModal('expenseModal',x);return}const ea=e.target.closest('[data-edit-account]');if(ea){const x=state.accounts.find(a=>a.id===ea.dataset.editAccount);showModal('accountModal',x);return}const et=e.target.closest('[data-edit-trade]');if(et){const x=state.trades.find(a=>a.id===et.dataset.editTrade);showModal('tradeModal',x);return}
  const de=e.target.closest('[data-delete-expense]');if(de){deleteItem('expenses',de.dataset.deleteExpense);return}const da=e.target.closest('[data-delete-account]');if(da){deleteItem('accounts',da.dataset.deleteAccount);return}const dt=e.target.closest('[data-delete-trade]');if(dt){deleteItem('trades',dt.dataset.deleteTrade);return}const ta=e.target.closest('[data-toggle-action]');if(ta){const a=state.actions.find(x=>x.id===ta.dataset.toggleAction);if(a)a.done=!a.done;renderAll();return}const xa=e.target.closest('[data-delete-action]');if(xa){deleteItem('actions',xa.dataset.deleteAction);return}const aj=e.target.closest('[data-account-journal]');if(aj){nav('journal');$('#tradeAccountFilter').value=aj.dataset.accountJournal;renderJournal();return}});
 $('#quickAddTrade').addEventListener('click',()=>showModal('tradeModal'));
+$('#copyAiPrompt').addEventListener('click',copyAiPrompt);$('#copyAiPrompt2').addEventListener('click',copyAiPrompt);
+$('#aiChartFile').addEventListener('change',e=>{const file=e.target.files&&e.target.files[0];if(!file)return;if(aiImageObjectUrl)URL.revokeObjectURL(aiImageObjectUrl);aiImageObjectUrl=URL.createObjectURL(file);$('#aiImagePreview').src=aiImageObjectUrl;$('#aiImagePreview').classList.remove('hidden');$('#aiImageMeta').textContent=file.name+' · '+(file.size/1024/1024).toFixed(2)+' MB · Preview local, không upload lên GitHub.'});
+$('#aiMethod').addEventListener('change',()=>{state.settings.lastCaptureMethod=$('#aiMethod').value.trim();save()});$('#aiAccount').addEventListener('change',()=>{state.settings.lastCaptureAccount=$('#aiAccount').value;save()});
+$('#reviewAiJson').addEventListener('click',reviewAiJson);$('#importAiTrade').addEventListener('click',importAiTrade);
+$('#clearAiJson').addEventListener('click',()=>{$('#aiJsonInput').value='';$('#aiTradePreview').classList.add('hidden');$('#aiImportStatus').innerHTML='';$('#importAiTrade').classList.add('hidden');$('#importAiTrade').disabled=true;pendingAiTrade=null});
+$('#clearAiCapture').addEventListener('click',clearAiCapture);
 $('#expenseForm').elements.currency.addEventListener('change',e=>{const fx=$('#expenseForm').elements.fxRate;if(e.target.value===(state.settings.baseCurrency||'USD'))fx.value='1';else fx.value=''});
 $('#expenseForm').addEventListener('submit',e=>{e.preventDefault();saveForm(e.target,'expense')});$('#accountForm').addEventListener('submit',e=>{e.preventDefault();saveForm(e.target,'account')});$('#tradeForm').addEventListener('submit',e=>{e.preventDefault();saveForm(e.target,'trade')});
 ['expenseSearch','expenseCategoryFilter','expenseFirmFilter'].forEach(id=>$('#'+id).addEventListener('input',renderExpenses));['accountSearch','accountStatusFilter'].forEach(id=>$('#'+id).addEventListener('input',renderAccounts));['tradeSearch','tradeAccountFilter','tradeMethodFilter','tradeResultFilter'].forEach(id=>$('#'+id).addEventListener('input',renderJournal));
